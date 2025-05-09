@@ -65,11 +65,20 @@ extern "C" {
 static const AVSampleFormat OUTPUT_FORMAT_PCM_16BIT = AV_SAMPLE_FMT_S16;
 // Output format corresponding to AudioFormat.ENCODING_PCM_FLOAT.
 static const AVSampleFormat OUTPUT_FORMAT_PCM_FLOAT = AV_SAMPLE_FMT_FLT;
+// For DSD, use special handling
+static const AVSampleFormat OUTPUT_FORMAT_DSD = AV_SAMPLE_FMT_FLT; // We'll convert DSD to float
 
 // LINT.IfChange
 static const int AUDIO_DECODER_ERROR_INVALID_DATA = -1;
 static const int AUDIO_DECODER_ERROR_OTHER = -2;
 // LINT.ThenChange(../java/androidx/media3/decoder/ffmpeg/FfmpegAudioDecoder.java)
+
+// DSD-specific parameters
+struct DsdContext {
+  bool isDsd;
+  int dsdSampleRate;
+  // Additional parameters needed for DSD processing
+};
 
 static jmethodID growOutputBufferMethod;
 
@@ -85,7 +94,8 @@ const AVCodec *getCodecByName(JNIEnv *env, jstring codecName);
  */
 AVCodecContext *createContext(JNIEnv *env, const AVCodec *codec,
                               jbyteArray extraData, jboolean outputFloat,
-                              jint rawSampleRate, jint rawChannelCount);
+                              jint rawSampleRate, jint rawChannelCount,
+                              jboolean isDsd);
 
 struct GrowOutputBufferCallback {
   uint8_t *operator()(int requiredSize) const;
@@ -103,6 +113,14 @@ struct GrowOutputBufferCallback {
 int decodePacket(AVCodecContext *context, AVPacket *packet,
                  uint8_t *outputBuffer, int outputSize,
                  GrowOutputBufferCallback growBuffer);
+
+/**
+ * Specialized handling for DSD decoding.
+ */
+int decodeDsdPacket(AVCodecContext *context, AVPacket *packet,
+                   uint8_t *outputBuffer, int outputSize,
+                   GrowOutputBufferCallback growBuffer,
+                   DsdContext *dsdContext);
 
 /**
  * Transforms ffmpeg AVERROR into a negative AUDIO_DECODER_ERROR constant value.
@@ -156,14 +174,15 @@ LIBRARY_FUNC(jboolean, ffmpegHasDecoder, jstring codecName) {
 
 AUDIO_DECODER_FUNC(jlong, ffmpegInitialize, jstring codecName,
                    jbyteArray extraData, jboolean outputFloat,
-                   jint rawSampleRate, jint rawChannelCount) {
+                   jint rawSampleRate, jint rawChannelCount,
+                   jboolean isDsd) {
   const AVCodec *codec = getCodecByName(env, codecName);
   if (!codec) {
     LOGE("Codec not found.");
     return 0L;
   }
   return (jlong)createContext(env, codec, extraData, outputFloat, rawSampleRate,
-                              rawChannelCount);
+                              rawChannelCount, isDsd);
 }
 
 AUDIO_DECODER_FUNC(jint, ffmpegDecode, jlong context, jobject inputData,
@@ -194,9 +213,22 @@ AUDIO_DECODER_FUNC(jint, ffmpegDecode, jlong context, jobject inputData,
   }
   packet->data = inputBuffer;
   packet->size = inputSize;
-  const int ret =
-      decodePacket((AVCodecContext *)context, packet, outputBuffer, outputSize,
-                   GrowOutputBufferCallback{env, thiz, decoderOutputBuffer});
+  
+  AVCodecContext *codecContext = (AVCodecContext *)context;
+  DsdContext *dsdContext = (DsdContext *)codecContext->opaque;
+  
+  int ret;
+  if (dsdContext && dsdContext->isDsd) {
+    // Use specialized DSD handling
+    ret = decodeDsdPacket(codecContext, packet, outputBuffer, outputSize,
+                         GrowOutputBufferCallback{env, thiz, decoderOutputBuffer},
+                         dsdContext);
+  } else {
+    // Use standard decoding path
+    ret = decodePacket(codecContext, packet, outputBuffer, outputSize,
+                      GrowOutputBufferCallback{env, thiz, decoderOutputBuffer});
+  }
+  
   av_packet_free(&packet);
   return ret;
 }
@@ -225,7 +257,18 @@ AUDIO_DECODER_FUNC(jint, ffmpegGetSampleRate, jlong context) {
     LOGE("Context must be non-NULL.");
     return -1;
   }
-  return ((AVCodecContext *)context)->sample_rate;
+  
+  AVCodecContext *codecContext = (AVCodecContext *)context;
+  DsdContext *dsdContext = (DsdContext *)codecContext->opaque;
+  
+  // If this is a DSD stream, we may need to return a different sample rate
+  // DSD sample rates are very high (2.8224MHz for DSD64), but we might choose
+  // to return the PCM-equivalent rate after conversion
+  if (dsdContext && dsdContext->isDsd && dsdContext->dsdSampleRate > 0) {
+    return dsdContext->dsdSampleRate;
+  }
+  
+  return codecContext->sample_rate;
 }
 
 AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
@@ -236,9 +279,19 @@ AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
   }
 
   AVCodecID codecId = context->codec_id;
-  if (codecId == AV_CODEC_ID_TRUEHD) {
-    // Release and recreate the context if the codec is TrueHD.
-    // TODO: Figure out why flushing doesn't work for this codec.
+  // Store DSD context info if present since we'll need to recreate it
+  DsdContext *dsdContext = (DsdContext *)context->opaque;
+  bool isDsd = false;
+  int dsdSampleRate = 0;
+  
+  if (dsdContext && dsdContext->isDsd) {
+    isDsd = true;
+    dsdSampleRate = dsdContext->dsdSampleRate;
+  }
+  
+  if (codecId == AV_CODEC_ID_TRUEHD || isDsd) {
+    // Release and recreate the context if the codec is TrueHD or DSD.
+    // Some codecs need full reinitialization
     releaseContext(context);
     const AVCodec *codec = avcodec_find_decoder(codecId);
     if (!codec) {
@@ -248,8 +301,9 @@ AUDIO_DECODER_FUNC(jlong, ffmpegReset, jlong jContext, jbyteArray extraData) {
     jboolean outputFloat =
         (jboolean)(context->request_sample_fmt == OUTPUT_FORMAT_PCM_FLOAT);
     return (jlong)createContext(env, codec, extraData, outputFloat,
-                                /* rawSampleRate= */ -1,
-                                /* rawChannelCount= */ -1);
+                               /* rawSampleRate= */ isDsd ? dsdSampleRate : -1,
+                               /* rawChannelCount= */ -1,
+                               /* isDsd= */ isDsd);
   }
 
   avcodec_flush_buffers(context);
@@ -274,14 +328,34 @@ const AVCodec *getCodecByName(JNIEnv *env, jstring codecName) {
 
 AVCodecContext *createContext(JNIEnv *env, const AVCodec *codec,
                               jbyteArray extraData, jboolean outputFloat,
-                              jint rawSampleRate, jint rawChannelCount) {
+                              jint rawSampleRate, jint rawChannelCount,
+                              jboolean isDsd) {
   AVCodecContext *context = avcodec_alloc_context3(codec);
   if (!context) {
     LOGE("Failed to allocate context.");
     return NULL;
   }
-  context->request_sample_fmt =
-      outputFloat ? OUTPUT_FORMAT_PCM_FLOAT : OUTPUT_FORMAT_PCM_16BIT;
+  
+  // Setup DSD context if needed
+  if (isDsd) {
+    DsdContext *dsdContext = (DsdContext *)malloc(sizeof(DsdContext));
+    if (!dsdContext) {
+      LOGE("Failed to allocate DSD context");
+      releaseContext(context);
+      return NULL;
+    }
+    dsdContext->isDsd = true;
+    // For DSD, use high sample rates or common output rates if converting
+    dsdContext->dsdSampleRate = rawSampleRate > 0 ? rawSampleRate : 2822400; // Default to DSD64 rate
+    context->opaque = dsdContext;
+    
+    // For DSD, we'll handle output format specially
+    context->request_sample_fmt = OUTPUT_FORMAT_DSD;
+  } else {
+    context->request_sample_fmt =
+        outputFloat ? OUTPUT_FORMAT_PCM_FLOAT : OUTPUT_FORMAT_PCM_16BIT;
+  }
+  
   if (extraData) {
     jsize size = env->GetArrayLength(extraData);
     context->extradata_size = size;
@@ -294,11 +368,20 @@ AVCodecContext *createContext(JNIEnv *env, const AVCodec *codec,
     }
     env->GetByteArrayRegion(extraData, 0, size, (jbyte *)context->extradata);
   }
+  
+  // Special codec handling for sample rates and channel layouts
   if (context->codec_id == AV_CODEC_ID_PCM_MULAW ||
-      context->codec_id == AV_CODEC_ID_PCM_ALAW) {
-    context->sample_rate = rawSampleRate;
-    av_channel_layout_default(&context->ch_layout, rawChannelCount);
+      context->codec_id == AV_CODEC_ID_PCM_ALAW ||
+      isDsd) {
+    // Use specific sample rate for these codecs
+    context->sample_rate = rawSampleRate > 0 ? rawSampleRate : 
+                          (isDsd ? 2822400 : 44100); // Default rates
+    
+    // Use specified channel count or default to stereo
+    av_channel_layout_default(&context->ch_layout, 
+                            rawChannelCount > 0 ? rawChannelCount : 2);
   }
+  
   context->err_recognition = AV_EF_IGNORE_ERR;
   int result = avcodec_open2(context, codec, NULL);
   if (result < 0) {
@@ -350,7 +433,7 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
       result =
           swr_alloc_set_opts2(&resampleContext,             // ps
                               &context->ch_layout,          // out_ch_layout
-                              context->request_sample_fmt,  // out_sample_fmt
+                              context->request_sample_fmt,   // out_sample_fmt
                               sampleRate,                   // out_sample_rate
                               &context->ch_layout,          // in_ch_layout
                               sampleFormat,                 // in_sample_fmt
@@ -407,6 +490,163 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
   return outSize;
 }
 
+// Special handling for DSD data
+int decodeDsdPacket(AVCodecContext *context, AVPacket *packet,
+                   uint8_t *outputBuffer, int outputSize,
+                   GrowOutputBufferCallback growBuffer,
+                   DsdContext *dsdContext) {
+  int result = 0;
+  // Queue input data
+  result = avcodec_send_packet(context, packet);
+  if (result) {
+    logError("avcodec_send_packet", result);
+    return transformError(result);
+  }
+
+  // Dequeue output data until it runs out
+  int outSize = 0;
+  while (true) {
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) {
+      LOGE("Failed to allocate output frame.");
+      return AUDIO_DECODER_ERROR_INVALID_DATA;
+    }
+    result = avcodec_receive_frame(context, frame);
+    if (result) {
+      av_frame_free(&frame);
+      if (result == AVERROR(EAGAIN)) {
+        break;
+      }
+      logError("avcodec_receive_frame", result);
+      return transformError(result);
+    }
+
+    // For DSD we need special handling
+    AVSampleFormat sampleFormat = context->sample_fmt;
+    int channelCount = context->ch_layout.nb_channels;
+    int sampleRate = context->sample_rate;
+    int sampleCount = frame->nb_samples;
+    
+    // DSD data can be very dense, ensure we have enough buffer space
+    int dsdBytesPerSample = av_get_bytes_per_sample(sampleFormat);
+    int outSampleSize = av_get_bytes_per_sample(context->request_sample_fmt);
+    
+    // For DSD we might need to downsample from extremely high rates
+    // This ratio controls how many DSD samples become one PCM sample
+    int conversionRatio = sampleRate / 44100; // Example: convert to 44.1kHz
+    if (conversionRatio < 1) conversionRatio = 1;
+    
+    // For DSD->PCM we need specialized resampling
+    SwrContext *resampleContext = static_cast<SwrContext *>(context->opaque);
+    if (!resampleContext) {
+      // Create a custom resampler for DSD
+      // We need to convert the high sample rate DSD data to a more reasonable PCM rate
+      // First, prepare a suitable output channel layout
+      result =
+          swr_alloc_set_opts2(&resampleContext,             // ps
+                              &context->ch_layout,          // out_ch_layout
+                              context->request_sample_fmt,   // out_sample_fmt
+                              44100,                        // target PCM rate
+                              &context->ch_layout,          // in_ch_layout
+                              sampleFormat,                 // in_sample_fmt
+                              sampleRate,                   // in_sample_rate
+                              0,                            // log_offset
+                              NULL                          // log_ctx
+          );
+      if (result < 0) {
+        logError("swr_alloc_set_opts2", result);
+        av_frame_free(&frame);
+        return transformError(result);
+      }
+      
+      // Initialize the resampler
+      result = swr_init(resampleContext);
+      if (result < 0) {
+        logError("swr_init", result);
+        av_frame_free(&frame);
+        return transformError(result);
+      }
+      
+      // Store the resampler in the context for reuse
+      context->opaque = resampleContext;
+      
+      // Update the DSD context with the output sample rate
+      dsdContext->dsdSampleRate = 44100; // The rate we're converting to
+    }
+    
+    // Calculate output samples after conversion
+    int outSamples = swr_get_out_samples(resampleContext, sampleCount);
+    int bufferOutSize = outSampleSize * channelCount * outSamples;
+    
+    // Ensure our output buffer is large enough
+    if (outSize + bufferOutSize > outputSize) {
+      LOGD(
+          "Output buffer size (%d) too small for DSD output data (%d), "
+          "reallocating buffer.",
+          outputSize, outSize + bufferOutSize);
+      outputSize = outSize + bufferOutSize;
+      outputBuffer = growBuffer(outputSize);
+      if (!outputBuffer) {
+        LOGE("Failed to reallocate output buffer for DSD.");
+        av_frame_free(&frame);
+        return AUDIO_DECODER_ERROR_OTHER;
+      }
+    }
+    
+    // Perform the actual conversion from DSD to PCM
+    result = swr_convert(resampleContext, 
+                        &outputBuffer, outSamples,
+                        (const uint8_t **)frame->data, frame->nb_samples);
+    
+    av_frame_free(&frame);
+    if (result < 0) {
+      logError("swr_convert for DSD", result);
+      return AUDIO_DECODER_ERROR_INVALID_DATA;
+    }
+    
+    // Check if any samples are remaining in the resampler
+    int available = swr_get_out_samples(resampleContext, 0);
+    if (available > 0) {
+      // We have leftover samples, convert them too
+      int additionalSize = outSampleSize * channelCount * available;
+      
+      // Make sure our buffer is still large enough
+      if (outSize + bufferOutSize + additionalSize > outputSize) {
+        outputSize = outSize + bufferOutSize + additionalSize;
+        uint8_t *newBuffer = growBuffer(outputSize);
+        if (!newBuffer) {
+          LOGE("Failed to reallocate output buffer for DSD leftovers.");
+          return AUDIO_DECODER_ERROR_OTHER;
+        }
+        // Update buffer pointer to the new location
+        outputBuffer = newBuffer + outSize + bufferOutSize;
+      } else {
+        // Advance the buffer pointer past the data we've already written
+        outputBuffer += bufferOutSize;
+      }
+      
+      // Convert the remaining samples
+      result = swr_convert(resampleContext, 
+                          &outputBuffer, available,
+                          NULL, 0);  // NULL for input means "flush"
+      
+      if (result < 0) {
+        logError("swr_convert flush for DSD", result);
+        return AUDIO_DECODER_ERROR_INVALID_DATA;
+      }
+      
+      // Add these bytes to our output size
+      bufferOutSize += additionalSize;
+    }
+    
+    // Update pointers and sizes
+    outputBuffer += bufferOutSize;
+    outSize += bufferOutSize;
+  }
+  
+  return outSize;
+}
+
 int transformError(int errorNumber) {
   return errorNumber == AVERROR_INVALIDDATA ? AUDIO_DECODER_ERROR_INVALID_DATA
                                             : AUDIO_DECODER_ERROR_OTHER;
@@ -423,10 +663,28 @@ void releaseContext(AVCodecContext *context) {
   if (!context) {
     return;
   }
-  SwrContext *swrContext;
-  if ((swrContext = (SwrContext *)context->opaque)) {
-    swr_free(&swrContext);
-    context->opaque = NULL;
+  
+  // Check if it's a DSD context or a regular context
+  DsdContext *dsdContext = NULL;
+  SwrContext *swrContext = NULL;
+  
+  void *opaquePtr = context->opaque;
+  if (opaquePtr) {
+    // First try to interpret as DsdContext 
+    dsdContext = static_cast<DsdContext*>(opaquePtr);
+    if (dsdContext && dsdContext->isDsd) {
+      // It's a DSD context, free it
+      free(dsdContext);
+      context->opaque = NULL;
+    } else {
+      // Not a DSD context, try as SwrContext
+      swrContext = static_cast<SwrContext*>(opaquePtr);
+      if (swrContext) {
+        swr_free(&swrContext);
+        context->opaque = NULL;
+      }
+    }
   }
+  
   avcodec_free_context(&context);
 }
