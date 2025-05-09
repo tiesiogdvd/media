@@ -200,7 +200,12 @@ import java.util.List;
 
   /** Returns the sample rate of output audio. */
   public int getSampleRate() {
-    return sampleRate;
+      // For DSD, we need to ensure we return a valid PCM rate regardless of what the native code says
+      if (isDsd) {
+        // Use a standard PCM rate that's supported by all devices
+        return 44100; // Must match the rate used in native resampler
+      }
+      return sampleRate;
   }
 
   /** Returns the encoding of output audio. */
