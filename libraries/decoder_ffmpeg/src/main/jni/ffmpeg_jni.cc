@@ -277,8 +277,8 @@ AUDIO_DECODER_FUNC(jint, ffmpegGetSampleRate, jlong context) {
   
   // For DSD, always return the downsampled rate
   if (dsdContext && dsdContext->isDsd) {
-    LOGD("Reporting DSD output sample rate: %d Hz", DSD_OUTPUT_SAMPLE_RATE);
-    return DSD_OUTPUT_SAMPLE_RATE;
+    // Use standard 44.1kHz for DSD output
+    return 44100;
   }
   
   int detectedRate = codecContext->sample_rate;
@@ -620,68 +620,63 @@ int decodeDsdPacket(AVCodecContext *context, AVPacket *packet,
     LOGI("DSD frame: format=%d, channels=%d, input_rate=%d, samples=%d", 
          sampleFormat, channelCount, sampleRate, sampleCount);
     
-    // DSD data can be very dense, ensure we have enough buffer space
-    int dsdBytesPerSample = av_get_bytes_per_sample(sampleFormat);
-    int outSampleSize = av_get_bytes_per_sample(context->request_sample_fmt);
+    // Use a lower output rate - 44.1kHz is safer
+    const int OUTPUT_RATE = 44100;
     
     // Access resampler from DsdContext
     SwrContext *resampleContext = dsdContext->resampleContext;
     if (!resampleContext) {
-      // Create a new resampler
-      LOGI("Creating new DSD resampler: %d Hz → %d Hz", 
-           sampleRate, DSD_OUTPUT_SAMPLE_RATE);
+      // Create a new resampler with minimal options
+      LOGI("Creating new basic DSD resampler: %d Hz → %d Hz", 
+           sampleRate, OUTPUT_RATE);
       
-      // Create resampler with basic parameters first
-      result =
-          swr_alloc_set_opts2(&resampleContext,             // ps
-                              &context->ch_layout,          // out_ch_layout
-                              context->request_sample_fmt,   // out_sample_fmt
-                              DSD_OUTPUT_SAMPLE_RATE,       // target PCM rate
-                              &context->ch_layout,          // in_ch_layout
-                              sampleFormat,                // in_sample_fmt
-                              sampleRate,                  // in_sample_rate
-                              0,                           // log_offset
-                              NULL                         // log_ctx
-          );
-      if (result < 0) {
-        logError("swr_alloc_set_opts2", result);
-        av_frame_free(&frame);
-        return transformError(result);
-      }
-      
-      // Setup high quality parameters
-      if (!setupDsdResampler(resampleContext, sampleRate, DSD_OUTPUT_SAMPLE_RATE)) {
-        LOGE("Failed to configure DSD resampler with high quality settings");
+      // Create a simple resampler with no extra options
+      resampleContext = swr_alloc();
+      if (!resampleContext) {
+        LOGE("Failed to allocate resampler");
         av_frame_free(&frame);
         return AUDIO_DECODER_ERROR_OTHER;
       }
       
-      // Store the resampler in our context for reuse
+      // Set channel layouts
+      av_opt_set_chlayout(resampleContext, "in_chlayout", &context->ch_layout, 0);
+      av_opt_set_chlayout(resampleContext, "out_chlayout", &context->ch_layout, 0);
+      
+      // Set sample formats
+      av_opt_set_sample_fmt(resampleContext, "in_sample_fmt", sampleFormat, 0);
+      av_opt_set_sample_fmt(resampleContext, "out_sample_fmt", context->request_sample_fmt, 0);
+      
+      // Set sample rates (input and output)
+      av_opt_set_int(resampleContext, "in_sample_rate", sampleRate, 0);
+      av_opt_set_int(resampleContext, "out_sample_rate", OUTPUT_RATE, 0);
+      
+      // Initialize with basic settings
+      result = swr_init(resampleContext);
+      if (result < 0) {
+        logError("swr_init with basic settings", result);
+        swr_free(&resampleContext);
+        av_frame_free(&frame);
+        return AUDIO_DECODER_ERROR_OTHER;
+      }
+      
+      // Store the resampler
       dsdContext->resampleContext = resampleContext;
-      dsdContext->dsdSampleRate = DSD_OUTPUT_SAMPLE_RATE;
+      dsdContext->dsdSampleRate = OUTPUT_RATE;
     }
     
-    // Safety check - ensure resampler is initialized
-    if (!resampleContext) {
-      LOGE("Failed to initialize resampler for DSD");
-      av_frame_free(&frame);
-      return AUDIO_DECODER_ERROR_OTHER;
-    }
-    
-    // Calculate output samples after conversion - leave extra room
+    // Get buffer details
+    int outSampleSize = av_get_bytes_per_sample(context->request_sample_fmt);
     int outSamples = swr_get_out_samples(resampleContext, sampleCount);
+    
     LOGI("DSD conversion: input samples=%d, expected output samples=%d", 
          sampleCount, outSamples);
          
-    int bufferOutSize = outSampleSize * channelCount * outSamples;
+    // Calculate required buffer size with extra margin
+    int bufferOutSize = outSampleSize * channelCount * (outSamples + 256);
     
-    // Ensure our output buffer is large enough - add 20% safety margin
-    bufferOutSize = (bufferOutSize * 120) / 100;
+    // Ensure buffer is large enough
     if (outSize + bufferOutSize > outputSize) {
-      LOGI(
-          "Output buffer size (%d) too small for DSD output data (%d), "
-          "reallocating buffer.",
-          outputSize, outSize + bufferOutSize);
+      LOGI("Reallocating buffer: %d → %d bytes", outputSize, outSize + bufferOutSize);
       outputSize = outSize + bufferOutSize;
       outputBuffer = growBuffer(outputSize);
       if (!outputBuffer) {
@@ -691,15 +686,15 @@ int decodeDsdPacket(AVCodecContext *context, AVPacket *packet,
       }
     }
     
-    // Pointer to the current position in the output buffer
+    // Get output buffer position
     uint8_t *currentOutputBuffer = outputBuffer + outSize;
     
-    // Perform the actual conversion from DSD to PCM
+    // Simple conversion - no fancy options
     result = swr_convert(resampleContext, 
-                       &currentOutputBuffer,  // destination
-                       outSamples,            // destination samples
-                       (const uint8_t **)frame->data,  // source
-                       frame->nb_samples);    // source samples
+                       &currentOutputBuffer,
+                       outSamples + 256, // Give extra room
+                       (const uint8_t **)frame->data,
+                       frame->nb_samples);
     
     av_frame_free(&frame);
     if (result < 0) {
@@ -707,60 +702,44 @@ int decodeDsdPacket(AVCodecContext *context, AVPacket *packet,
       return AUDIO_DECODER_ERROR_INVALID_DATA;
     }
     
-    LOGI("DSD conversion produced %d samples (%d bytes per sample)", 
-         result, outSampleSize);
+    LOGI("DSD conversion produced %d samples", result);
     
-    // Calculate actual output size
+    // Add to total size
     int actualOutSize = result * outSampleSize * channelCount;
     outSize += actualOutSize;
     
-    // Check if any samples are remaining in the resampler
+    // Flush any remaining samples
     int available = swr_get_out_samples(resampleContext, 0);
     if (available > 0) {
-      LOGI("Remaining samples in DSD resampler: %d", available);
-      // We have leftover samples, convert them too
-      int additionalSize = outSampleSize * channelCount * available;
+      LOGI("Flushing %d samples from resampler", available);
       
-      // Make sure our buffer is still large enough
-      if (outSize + additionalSize > outputSize) {
-        LOGI("Growing buffer for DSD leftover samples: %d bytes needed", additionalSize);
-        outputSize = outSize + additionalSize;
-        
-        // Get a new buffer with the increased size
+      // Ensure buffer is large enough for the flush
+      int flushSize = outSampleSize * channelCount * available;
+      if (outSize + flushSize > outputSize) {
+        outputSize = outSize + flushSize;
         uint8_t *newBuffer = growBuffer(outputSize);
         if (!newBuffer) {
-          LOGE("Failed to reallocate output buffer for DSD leftovers.");
-          return AUDIO_DECODER_ERROR_OTHER;
+          LOGE("Failed to grow buffer for flush");
+          return outSize > 0 ? outSize : AUDIO_DECODER_ERROR_OTHER;
         }
-        
-        // Update pointer to current position in the new buffer
         currentOutputBuffer = newBuffer + outSize;
       } else {
-        // Advance the buffer pointer past the data we've already written
         currentOutputBuffer = outputBuffer + outSize;
       }
       
-      // Convert the remaining samples
+      // Flush remaining samples
       result = swr_convert(resampleContext, 
-                         &currentOutputBuffer,  // destination
-                         available,             // max destination samples
-                         NULL,                  // NULL for input = flush
-                         0);                    // 0 input samples = flush
+                         &currentOutputBuffer, 
+                         available,
+                         NULL, 0);
       
-      if (result < 0) {
-        logError("swr_convert flush for DSD", result);
-        return AUDIO_DECODER_ERROR_INVALID_DATA;
+      if (result > 0) {
+        outSize += result * outSampleSize * channelCount;
       }
-      
-      LOGI("DSD flush produced %d additional samples", result);
-      
-      // Add these bytes to our output size
-      int actualAdditionalSize = result * outSampleSize * channelCount;
-      outSize += actualAdditionalSize;
     }
   }
   
-  return outSize;
+  return outSize > 0 ? outSize : AUDIO_DECODER_ERROR_OTHER;
 }
 
 int transformError(int errorNumber) {
