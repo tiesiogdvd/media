@@ -166,13 +166,21 @@ public final class FfmpegAudioRenderer extends DecoderAudioRenderer<FfmpegAudioD
    */
   @Override
   protected Format getOutputFormat(FfmpegAudioDecoder decoder) {
-    Assertions.checkNotNull(decoder);
-    return new Format.Builder()
-        .setSampleMimeType(MimeTypes.AUDIO_RAW)
-        .setChannelCount(decoder.getChannelCount())
-        .setSampleRate(decoder.getSampleRate())
-        .setPcmEncoding(decoder.getEncoding())
-        .build();
+  Assertions.checkNotNull(decoder);
+  int sampleRate = decoder.getSampleRate();
+  
+  // Additional safety check for valid sample rates
+  if (sampleRate < 8000 || sampleRate > 192000) {
+    // Force a compatible PCM rate if we get an out-of-range value
+    sampleRate = 44100;
+  }
+  
+  return new Format.Builder()
+      .setSampleMimeType(MimeTypes.AUDIO_RAW)
+      .setChannelCount(decoder.getChannelCount())
+      .setSampleRate(sampleRate)
+      .setPcmEncoding(decoder.getEncoding())
+      .build();
   }
 
   /**
