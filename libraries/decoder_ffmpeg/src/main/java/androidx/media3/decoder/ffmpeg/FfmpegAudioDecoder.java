@@ -35,6 +35,8 @@ import java.util.List;
 
   private static final int INITIAL_OUTPUT_BUFFER_SIZE_16BIT = 65535;
   private static final int INITIAL_OUTPUT_BUFFER_SIZE_32BIT = INITIAL_OUTPUT_BUFFER_SIZE_16BIT * 2;
+  // For DSD, we need even larger buffers due to high sample rates
+  private static final int INITIAL_OUTPUT_BUFFER_SIZE_DSD = INITIAL_OUTPUT_BUFFER_SIZE_32BIT * 8;
 
   private static final int AUDIO_DECODER_ERROR_INVALID_DATA = -1;
   private static final int AUDIO_DECODER_ERROR_OTHER = -2;
@@ -43,6 +45,7 @@ import java.util.List;
   @Nullable private final byte[] extraData;
   private final @C.PcmEncoding int encoding;
   private int outputBufferSize;
+  private final boolean isDsd;
 
   private long nativeContext; // May be reassigned on resetting the codec.
   private boolean hasOutputFormat;
@@ -56,6 +59,17 @@ import java.util.List;
       int initialInputBufferSize,
       boolean outputFloat)
       throws FfmpegDecoderException {
+    this(format, numInputBuffers, numOutputBuffers, initialInputBufferSize, outputFloat, false);
+  }
+  
+  public FfmpegAudioDecoder(
+      Format format,
+      int numInputBuffers,
+      int numOutputBuffers,
+      int initialInputBufferSize,
+      boolean outputFloat,
+      boolean isDsd)
+      throws FfmpegDecoderException {
     super(new DecoderInputBuffer[numInputBuffers], new SimpleDecoderOutputBuffer[numOutputBuffers]);
     if (!FfmpegLibrary.isAvailable()) {
       throw new FfmpegDecoderException("Failed to load decoder native libraries.");
@@ -63,11 +77,20 @@ import java.util.List;
     checkNotNull(format.sampleMimeType);
     codecName = checkNotNull(FfmpegLibrary.getCodecName(format.sampleMimeType));
     extraData = getExtraData(format.sampleMimeType, format.initializationData);
-    encoding = outputFloat ? C.ENCODING_PCM_FLOAT : C.ENCODING_PCM_16BIT;
-    outputBufferSize =
-        outputFloat ? INITIAL_OUTPUT_BUFFER_SIZE_32BIT : INITIAL_OUTPUT_BUFFER_SIZE_16BIT;
+    
+    this.isDsd = isDsd || "dsd_lsbf".equals(codecName) || "dsd_msbf".equals(codecName);
+    
+    // For DSD, we always use floating point for better quality
+    if (this.isDsd) {
+      encoding = C.ENCODING_PCM_FLOAT;
+      outputBufferSize = INITIAL_OUTPUT_BUFFER_SIZE_DSD;
+    } else {
+      encoding = outputFloat ? C.ENCODING_PCM_FLOAT : C.ENCODING_PCM_16BIT;
+      outputBufferSize = outputFloat ? INITIAL_OUTPUT_BUFFER_SIZE_32BIT : INITIAL_OUTPUT_BUFFER_SIZE_16BIT;
+    }
+    
     nativeContext =
-        ffmpegInitialize(codecName, extraData, outputFloat, format.sampleRate, format.channelCount);
+        ffmpegInitialize(codecName, extraData, outputFloat, format.sampleRate, format.channelCount, this.isDsd);
     if (nativeContext == 0) {
       throw new FfmpegDecoderException("Initialization failed.");
     }
@@ -128,14 +151,23 @@ import java.util.List;
     if (!hasOutputFormat) {
       channelCount = ffmpegGetChannelCount(nativeContext);
       sampleRate = ffmpegGetSampleRate(nativeContext);
-      if (sampleRate == 0 && "alac".equals(codecName)) {
-        checkNotNull(extraData);
-        // ALAC decoder did not set the sample rate in earlier versions of FFmpeg. See
-        // https://trac.ffmpeg.org/ticket/6096.
-        ParsableByteArray parsableExtraData = new ParsableByteArray(extraData);
-        parsableExtraData.setPosition(extraData.length - 4);
-        sampleRate = parsableExtraData.readUnsignedIntToInt();
+      
+      // Handle special cases for codecs
+      if (sampleRate == 0) {
+        if ("alac".equals(codecName)) {
+          checkNotNull(extraData);
+          // ALAC decoder did not set the sample rate in earlier versions of FFmpeg. See
+          // https://trac.ffmpeg.org/ticket/6096.
+          ParsableByteArray parsableExtraData = new ParsableByteArray(extraData);
+          parsableExtraData.setPosition(extraData.length - 4);
+          sampleRate = parsableExtraData.readUnsignedIntToInt();
+        } else if (isDsd) {
+          // For DSD, if sample rate is not properly detected, use a default DSD rate
+          // DSD64 = 2.8224MHz
+          sampleRate = 2822400;
+        }
       }
+      
       hasOutputFormat = true;
     }
     // Get a new reference to the output ByteBuffer in case the native decode method reallocated the
@@ -185,11 +217,22 @@ import java.util.List;
     switch (mimeType) {
       case MimeTypes.AUDIO_AAC:
       case MimeTypes.AUDIO_OPUS:
-        return initializationData.get(0);
+        return initializationData.isEmpty() ? null : initializationData.get(0);
       case MimeTypes.AUDIO_ALAC:
         return getAlacExtraData(initializationData);
       case MimeTypes.AUDIO_VORBIS:
         return getVorbisExtraData(initializationData);
+      case "audio/dsf":
+      case "audio/x-dsf":
+      case "audio/dsd_lsbf":
+      case "audio/dsdiff":
+      case "audio/x-dsdiff":
+      case "audio/x-dff":
+      case "audio/dsd_msbf":
+      case "audio/dsd":
+        // For DSD, we might need to pass format parameters like sample rate or bit depth
+        // Usually, DSF/DSD formats don't require extra data but pass it if available
+        return initializationData.isEmpty() ? null : initializationData.get(0);
       default:
         // Other codecs do not require extra data.
         return null;
@@ -232,7 +275,8 @@ import java.util.List;
       @Nullable byte[] extraData,
       boolean outputFloat,
       int rawSampleRate,
-      int rawChannelCount);
+      int rawChannelCount,
+      boolean isDsd);
 
   private native int ffmpegDecode(
       long context,
