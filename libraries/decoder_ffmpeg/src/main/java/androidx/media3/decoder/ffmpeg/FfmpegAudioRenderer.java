@@ -47,6 +47,9 @@ public final class FfmpegAudioRenderer extends DecoderAudioRenderer<FfmpegAudioD
 
   /** The default input buffer size. */
   private static final int DEFAULT_INPUT_BUFFER_SIZE = 960 * 6;
+  
+  /** A larger buffer size for DSD content. */
+  private static final int DSD_INPUT_BUFFER_SIZE = DEFAULT_INPUT_BUFFER_SIZE * 8;
 
   public FfmpegAudioRenderer() {
     this(/* eventHandler= */ null, /* eventListener= */ null);
@@ -112,6 +115,20 @@ public final class FfmpegAudioRenderer extends DecoderAudioRenderer<FfmpegAudioD
   }
 
   /**
+   * Checks if the format is a DSD audio format.
+   */
+  private boolean isDsdFormat(String mimeType) {
+    return "audio/dsf".equals(mimeType) 
+        || "audio/x-dsf".equals(mimeType)
+        || "audio/dsd_lsbf".equals(mimeType)
+        || "audio/dsdiff".equals(mimeType)
+        || "audio/x-dsdiff".equals(mimeType)
+        || "audio/x-dff".equals(mimeType)
+        || "audio/dsd_msbf".equals(mimeType)
+        || "audio/dsd".equals(mimeType);
+  }
+
+  /**
    * {@inheritDoc}
    *
    * @hide
@@ -120,11 +137,24 @@ public final class FfmpegAudioRenderer extends DecoderAudioRenderer<FfmpegAudioD
   protected FfmpegAudioDecoder createDecoder(Format format, @Nullable CryptoConfig cryptoConfig)
       throws FfmpegDecoderException {
     TraceUtil.beginSection("createFfmpegAudioDecoder");
+    
+    // Check if this is a DSD format
+    String mimeType = Assertions.checkNotNull(format.sampleMimeType);
+    boolean isDsd = isDsdFormat(mimeType);
+    
+    // Use a larger buffer for DSD content
     int initialInputBufferSize =
-        format.maxInputSize != Format.NO_VALUE ? format.maxInputSize : DEFAULT_INPUT_BUFFER_SIZE;
+        format.maxInputSize != Format.NO_VALUE 
+            ? format.maxInputSize 
+            : (isDsd ? DSD_INPUT_BUFFER_SIZE : DEFAULT_INPUT_BUFFER_SIZE);
+    
+    // For DSD, we should always use float output
+    boolean outputFloat = isDsd || shouldOutputFloat(format);
+    
     FfmpegAudioDecoder decoder =
         new FfmpegAudioDecoder(
-            format, NUM_BUFFERS, NUM_BUFFERS, initialInputBufferSize, shouldOutputFloat(format));
+            format, NUM_BUFFERS, NUM_BUFFERS, initialInputBufferSize, outputFloat, isDsd);
+    
     TraceUtil.endSection();
     return decoder;
   }
@@ -155,6 +185,13 @@ public final class FfmpegAudioRenderer extends DecoderAudioRenderer<FfmpegAudioD
   }
 
   private boolean shouldOutputFloat(Format inputFormat) {
+    String mimeType = Assertions.checkNotNull(inputFormat.sampleMimeType);
+    
+    // Always use floating point for DSD formats
+    if (isDsdFormat(mimeType)) {
+      return true;
+    }
+    
     if (!sinkSupportsFormat(inputFormat, C.ENCODING_PCM_16BIT)) {
       // We have no choice because the sink doesn't support 16-bit integer PCM.
       return true;
