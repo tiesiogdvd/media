@@ -73,6 +73,8 @@ static const int AUDIO_DECODER_ERROR_INVALID_DATA = -1;
 static const int AUDIO_DECODER_ERROR_OTHER = -2;
 // LINT.ThenChange(../java/androidx/media3/decoder/ffmpeg/FfmpegAudioDecoder.java)
 
+static const int DSD_OUTPUT_SAMPLE_RATE = 44100; // or 48000
+
 // DSD-specific parameters
 struct DsdContext {
   bool isDsd;
@@ -261,11 +263,10 @@ AUDIO_DECODER_FUNC(jint, ffmpegGetSampleRate, jlong context) {
   AVCodecContext *codecContext = (AVCodecContext *)context;
   DsdContext *dsdContext = (DsdContext *)codecContext->opaque;
   
-  // If this is a DSD stream, we may need to return a different sample rate
-  // DSD sample rates are very high (2.8224MHz for DSD64), but we might choose
-  // to return the PCM-equivalent rate after conversion
-  if (dsdContext && dsdContext->isDsd && dsdContext->dsdSampleRate > 0) {
-    return dsdContext->dsdSampleRate;
+  // For DSD, always return a standard PCM rate
+  if (dsdContext && dsdContext->isDsd) {
+    // Return the downsampled PCM rate, never the original DSD rate
+    return 44100; // or 48000, must match the rate used in resampling
   }
   
   return codecContext->sample_rate;
@@ -345,8 +346,7 @@ AVCodecContext *createContext(JNIEnv *env, const AVCodec *codec,
       return NULL;
     }
     dsdContext->isDsd = true;
-    // For DSD, use high sample rates or common output rates if converting
-    dsdContext->dsdSampleRate = rawSampleRate > 0 ? rawSampleRate : 2822400; // Default to DSD64 rate
+    dsdContext->dsdSampleRate = DSD_OUTPUT_SAMPLE_RATE;
     context->opaque = dsdContext;
     
     // For DSD, we'll handle output format specially
@@ -542,17 +542,16 @@ int decodeDsdPacket(AVCodecContext *context, AVPacket *packet,
       // Create a custom resampler for DSD
       // We need to convert the high sample rate DSD data to a more reasonable PCM rate
       // First, prepare a suitable output channel layout
-      result =
-          swr_alloc_set_opts2(&resampleContext,             // ps
-                              &context->ch_layout,          // out_ch_layout
-                              context->request_sample_fmt,   // out_sample_fmt
-                              44100,                        // target PCM rate
-                              &context->ch_layout,          // in_ch_layout
-                              sampleFormat,                 // in_sample_fmt
-                              sampleRate,                   // in_sample_rate
-                              0,                            // log_offset
-                              NULL                          // log_ctx
-          );
+      result = swr_alloc_set_opts2(&resampleContext,
+                          &context->ch_layout,        // out_ch_layout
+                          context->request_sample_fmt, // out_sample_fmt
+                          DSD_OUTPUT_SAMPLE_RATE,     // Use constant PCM rate
+                          &context->ch_layout,        // in_ch_layout
+                          sampleFormat,               // in_sample_fmt
+                          sampleRate,                 // in_sample_rate (original high DSD rate)
+                          0,                         
+                          NULL);
+      
       if (result < 0) {
         logError("swr_alloc_set_opts2", result);
         av_frame_free(&frame);
