@@ -153,6 +153,18 @@ public final class FfmpegLibrary {
         return "h264";
       case MimeTypes.VIDEO_H265:
         return "hevc";
+      case "audio/dsf":
+      case "audio/x-dsf": 
+      case "audio/dsd_lsbf":
+        return "dsd_lsbf";
+      case "audio/dsdiff":
+      case "audio/x-dsdiff":
+      case "audio/x-dff":
+      case "audio/dsd_msbf":
+        return "dsd_msbf";
+      case "audio/dsd":
+        // Generic DSD - default to LSB first, most common for DSF files
+        return "dsd_lsbf";
       default:
         return null;
     }
